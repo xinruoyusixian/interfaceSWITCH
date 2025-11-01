@@ -134,8 +134,6 @@ function action_clear_logs()
 end
 
 function action_get_configured_interfaces()
-    local LuciUtil = require "luci.util"
-    local LuciSys = require "luci.sys"
     local interfaces = {}
     
     -- 从UCI配置读取启用的接口
