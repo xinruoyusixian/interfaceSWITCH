@@ -1,7 +1,7 @@
 #!/bin/sh
 
 # ==============================================
-# 网络切换器 - OpenWrt插件版
+# 网络切换器 - OpenWrt插件版（动态配置）
 # ==============================================
 
 # 强制设置完整的环境变量
@@ -18,7 +18,7 @@ umask 0022
 cd /tmp
 
 # ==============================================
-# 配置区域 - 从UCI配置读取
+# 配置区域 - 从UCI配置动态读取
 # ==============================================
 
 # UCI配置读取函数
@@ -28,17 +28,26 @@ read_uci_config() {
     CHECK_INTERVAL=$(uci get network_switcher.settings.check_interval 2>/dev/null || echo "60")
     
     # 读取Ping配置
-    PING_TARGETS=""
     PING_COUNT=$(uci get network_switcher.settings.ping_count 2>/dev/null || echo "3")
     PING_TIMEOUT=$(uci get network_switcher.settings.ping_timeout 2>/dev/null || echo "3")
     PING_SUCCESS_COUNT=$(uci get network_switcher.settings.ping_success_count 2>/dev/null || echo "1")
     SWITCH_WAIT_TIME=$(uci get network_switcher.settings.switch_wait_time 2>/dev/null || echo "3")
     
-    # 获取Ping目标列表
-    local targets=$(uci get network_switcher.settings.ping_targets 2>/dev/null)
-    if [ -n "$targets" ]; then
-        PING_TARGETS="$targets"
-    else
+    # 动态获取Ping目标列表
+    PING_TARGETS=""
+    local target_index=1
+    while true; do
+        local target=$(uci get network_switcher.settings.ping_targets 2>/dev/null | awk -v i=$target_index '{print $i}')
+        if [ -n "$target" ] && [ "$target" != "list" ]; then
+            PING_TARGETS="$PING_TARGETS $target"
+            target_index=$((target_index + 1))
+        else
+            break
+        fi
+    done
+    
+    # 如果没有配置目标，使用默认值
+    if [ -z "$PING_TARGETS" ]; then
         PING_TARGETS="8.8.8.8 1.1.1.1 223.5.5.5 114.114.114.114"
     fi
     
@@ -60,7 +69,7 @@ read_uci_config() {
             INTERFACE_COUNT=$((INTERFACE_COUNT + 1))
             INTERFACES="$INTERFACES $interface"
             
-            # 设置接口metric变量
+            # 动态设置接口metric变量
             eval "${interface}_metric=$metric"
             
             if [ "$primary" = "1" ]; then
@@ -77,6 +86,10 @@ read_uci_config() {
         PRIMARY_INTERFACE="wan"
         INTERFACE_COUNT=2
     fi
+    
+    # 记录配置读取结果
+    log "配置读取: 启用=$ENABLED, 检查间隔=$CHECK_INTERVAL, Ping目标=$PING_TARGETS"
+    log "接口配置: $INTERFACES, 主接口=$PRIMARY_INTERFACE"
 }
 
 # 日志和状态文件
@@ -216,10 +229,13 @@ is_interface_available() {
     fi
 }
 
-# 修复的网络连通性测试
+# 修复的网络连通性测试 - 使用动态配置
 test_network_connectivity() {
     local interface="$1"
     local device=""
+    
+    # 重新读取配置确保使用最新参数
+    read_uci_config
     
     # 获取接口对应的设备名
     device=$(get_interface_device "$interface")
@@ -229,6 +245,7 @@ test_network_connectivity() {
     fi
     
     log "测试接口 $interface (设备: $device) 的网络连通性"
+    log "Ping参数: 目标=$PING_TARGETS, 次数=$PING_COUNT, 超时=$PING_TIMEOUT, 成功阈值=$PING_SUCCESS_COUNT"
     
     local success_count=0
     local test_targets="$PING_TARGETS"
@@ -247,10 +264,10 @@ test_network_connectivity() {
     done
     
     if [ $success_count -ge $PING_SUCCESS_COUNT ]; then
-        log "✓ 接口 $interface 网络连通性正常"
+        log "✓ 接口 $interface 网络连通性正常 (成功: $success_count/$PING_SUCCESS_COUNT)"
         return 0
     else
-        log "✗ 接口 $interface 网络连通性异常"
+        log "✗ 接口 $interface 网络连通性异常 (成功: $success_count/$PING_SUCCESS_COUNT)"
         return 1
     fi
 }
@@ -277,14 +294,14 @@ is_interface_ready_for_switch() {
     return 0
 }
 
-# 获取接口的metric值
+# 获取接口的metric值 - 动态从配置读取
 get_interface_metric() {
     local interface="$1"
     local metric_var="${interface}_metric"
     eval echo \$$metric_var
 }
 
-# 执行实际的路由切换
+# 执行实际的路由切换 - 使用动态metric
 perform_route_switch() {
     local target_interface="$1"
     local gateway=""
@@ -315,7 +332,7 @@ perform_route_switch() {
     ip route add default via "$gateway" dev "$device" metric $metric
     
     # 等待路由表更新
-    log "等待路由表更新..."
+    log "等待路由表更新 $SWITCH_WAIT_TIME 秒..."
     sleep $SWITCH_WAIT_TIME
     
     return 0
@@ -381,6 +398,10 @@ rollback_to_interface() {
 # 增强的切换网络接口函数（预检查+验证+回滚）
 switch_interface() {
     local target_interface="$1"
+    
+    # 重新读取配置确保使用最新参数
+    read_uci_config
+    
     local current_interface=$(get_current_default_interface)
     local current_logical_interface=""
     
@@ -476,6 +497,9 @@ switch_interface() {
 ensure_fallback_route() {
     log "执行兜底路由检查"
     
+    # 重新读取配置确保使用最新参数
+    read_uci_config
+    
     local current_interface=$(get_current_default_interface)
     
     log "当前接口: $current_interface"
@@ -529,6 +553,9 @@ ensure_fallback_route() {
 # 智能自动切换（主接口优先策略）
 auto_switch() {
     log "开始智能自动网络切换 - 主接口优先策略"
+    
+    # 重新读取配置确保使用最新参数
+    read_uci_config
     
     # 先执行兜底检查
     ensure_fallback_route
@@ -635,6 +662,16 @@ show_status() {
         echo "主接口: $PRIMARY_INTERFACE"
     fi
     
+    # 显示配置摘要
+    echo -e "\n--- 配置摘要 ---"
+    echo "启用服务: $ENABLED"
+    echo "检查间隔: $CHECK_INTERVAL 秒"
+    echo "Ping目标: $PING_TARGETS"
+    echo "Ping次数: $PING_COUNT"
+    echo "Ping超时: $PING_TIMEOUT 秒"
+    echo "成功阈值: $PING_SUCCESS_COUNT"
+    echo "切换等待: $SWITCH_WAIT_TIME 秒"
+    
     # 显示各接口状态
     for interface in $INTERFACES; do
         echo -e "\n--- $interface 状态 ---"
@@ -671,21 +708,13 @@ show_status() {
     else
         echo "保存的状态: 无"
     fi
-    
-    # 显示配置摘要
-    echo -e "\n--- 配置摘要 ---"
-    echo "启用服务: $ENABLED"
-    echo "检查间隔: $CHECK_INTERVAL 秒"
-    echo "Ping目标: $PING_TARGETS"
-    echo "Ping次数: $PING_COUNT"
-    echo "成功阈值: $PING_SUCCESS_COUNT"
 }
 
 # 测试函数
 test_connectivity() {
     echo "=== 网络连通性测试 ==="
     
-    # 读取配置
+    # 重新读取配置确保使用最新参数
     read_uci_config
     
     show_status
@@ -716,11 +745,11 @@ daemon_mode() {
     log "启动守护进程模式"
     
     while true; do
-        # 检查服务是否启用
+        # 重新读取配置确保使用最新参数
         read_uci_config
         
         if [ "$ENABLED" = "1" ]; then
-            log "执行自动网络检查"
+            log "执行自动网络检查 (间隔: $CHECK_INTERVAL 秒)"
             auto_switch
         else
             log "服务未启用，跳过检查"
@@ -733,6 +762,9 @@ daemon_mode() {
 
 # 显示帮助信息
 show_help() {
+    # 读取配置以显示当前接口
+    read_uci_config
+    
     echo "智能版OpenWrt网络出口切换插件"
     echo ""
     echo "用法: $0 [命令]"
@@ -745,8 +777,10 @@ show_help() {
     echo "  daemon      - 启动守护进程模式"
     echo "  help        - 显示此帮助信息"
     echo ""
-    echo "配置接口: $INTERFACES"
-    echo "主接口: $PRIMARY_INTERFACE"
+    echo "当前配置接口: $INTERFACES"
+    if [ -n "$PRIMARY_INTERFACE" ]; then
+        echo "主接口: $PRIMARY_INTERFACE"
+    fi
     echo ""
     echo "配置说明:"
     echo "  所有配置通过UCI配置文件 /etc/config/network_switcher 管理"
