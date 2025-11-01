@@ -1,4 +1,4 @@
-name: Build OpenWrt IPK
+name: Build Network Switcher IPK
 
 on:
   workflow_dispatch:
@@ -9,17 +9,16 @@ on:
         default: '22.03.5'
         type: choice
         options:
-        - '22.03.5'
-        - '21.02.7'
+          - '22.03.5'
+          - '21.02.7'
       architecture:
         description: '设备架构'
         required: true
         default: 'x86_64'
         type: choice
         options:
-        - 'x86_64'
-        - 'aarch64_generic'
-        - 'arm_cortex-a9'
+          - 'aarch64_generic'
+          - 'x86_64'
 
 env:
   PACKAGE_NAME: network-switcher
@@ -29,10 +28,20 @@ jobs:
     runs-on: ubuntu-22.04
     
     steps:
-    - name: 检出代码
+    - name: Checkout code
       uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
 
-    - name: 安装依赖
+    - name: Debug - List files
+      run: |
+        echo "=== 仓库文件结构 ==="
+        find . -type f -name "*.mk" -o -name "Makefile" -o -name "*.md" | head -20
+        echo "=== 当前目录 ==="
+        pwd
+        ls -la
+
+    - name: Setup environment
       run: |
         sudo apt-get update
         sudo apt-get install -y \
@@ -48,48 +57,74 @@ jobs:
           wget \
           unzip \
           python3 \
-          python3-setuptools
+          python3-setuptools \
+          rsync
 
-    - name: 下载OpenWrt SDK
+    - name: Download OpenWrt SDK
       run: |
-        # 根据版本和架构下载对应的SDK
+        echo "下载OpenWrt SDK..."
+        
         if [ "${{ inputs.architecture }}" = "x86_64" ]; then
           SDK_URL="https://downloads.openwrt.org/releases/${{ inputs.openwrt_version }}/targets/x86/64/openwrt-sdk-${{ inputs.openwrt_version }}-x86-64_gcc-11.2.0_musl.Linux-x86_64.tar.xz"
         elif [ "${{ inputs.architecture }}" = "aarch64_generic" ]; then
           SDK_URL="https://downloads.openwrt.org/releases/${{ inputs.openwrt_version }}/targets/armvirt/64/openwrt-sdk-${{ inputs.openwrt_version }}-aarch64_generic_gcc-11.2.0_musl.Linux-x86_64.tar.xz"
-        elif [ "${{ inputs.architecture }}" = "arm_cortex-a9" ]; then
-          SDK_URL="https://downloads.openwrt.org/releases/${{ inputs.openwrt_version }}/targets/mvebu/cortexa9/openwrt-sdk-${{ inputs.openwrt_version }}-mvebu-cortexa9_gcc-11.2.0_musl_eabi.Linux-x86_64.tar.xz"
+        else
+          echo "不支持的架构: ${{ inputs.architecture }}"
+          exit 1
         fi
         
-        wget -O sdk.tar.xz "$SDK_URL"
+        echo "SDK URL: $SDK_URL"
+        wget -q --show-progress -O sdk.tar.xz "$SDK_URL"
+        
+        # 解压SDK
         tar -xf sdk.tar.xz
         SDK_DIR=$(find . -maxdepth 1 -type d -name "openwrt-sdk-*" | head -1)
+        
+        if [ -z "$SDK_DIR" ]; then
+          echo "无法找到SDK目录!"
+          tar -tf sdk.tar.xz | head -10
+          exit 1
+        fi
+        
         echo "SDK_DIR=$SDK_DIR" >> $GITHUB_ENV
-        echo "使用SDK目录: $SDK_DIR"
+        echo "使用SDK: $SDK_DIR"
 
-    - name: 准备包目录
+    - name: Prepare package
       run: |
+        echo "准备包目录..."
+        
+        # 创建包目录
         mkdir -p $SDK_DIR/package/$PACKAGE_NAME
-        # 复制所有文件到包目录
-        cp -r ./* $SDK_DIR/package/$PACKAGE_NAME/
-        # 确保Makefile有执行权限
-        chmod +x $SDK_DIR/package/$PACKAGE_NAME/Makefile
+        
+        # 复制所有文件
+        echo "复制文件到包目录..."
+        cp -r ./* $SDK_DIR/package/$PACKAGE_NAME/ 2>/dev/null || true
+        
+        # 显示复制的文件
+        echo "包目录内容:"
+        ls -la $SDK_DIR/package/$PACKAGE_NAME/ | head -10
 
-    - name: 编译IPK包
+    - name: Build package
       working-directory: $SDK_DIR
       run: |
+        echo "开始编译过程..."
+        
         # 更新feeds
         ./scripts/feeds update -a
+        ./scripts/feeds install -a
         
-        # 配置包
-        echo "CONFIG_PACKAGE_${PACKAGE_NAME}=m" >> .config
+        # 创建配置
+        echo "CONFIG_PACKAGE_$PACKAGE_NAME=m" > .config
         make defconfig
         
-        echo "开始编译包..."
-        # 编译特定包
-        make package/$PACKAGE_NAME/compile V=99
+        echo "编译配置:"
+        cat .config | grep $PACKAGE_NAME || echo "包未在配置中找到"
         
-        # 检查编译结果
+        # 编译包
+        echo "开始编译包 $PACKAGE_NAME..."
+        make package/$PACKAGE_NAME/compile V=s -j$(nproc)
+        
+        # 检查结果
         if [ $? -eq 0 ]; then
           echo "✅ 编译成功!"
         else
@@ -97,36 +132,43 @@ jobs:
           exit 1
         fi
 
-    - name: 查找生成的IPK文件
+    - name: Find and collect IPK
       run: |
-        # 在bin目录中查找IPK文件
-        IPK_PATH=$(find $SDK_DIR/bin -name "*${PACKAGE_NAME}*.ipk" -type f)
+        echo "查找生成的IPK文件..."
+        
+        # 在多个可能的位置查找
+        IPK_PATH=$(find $SDK_DIR -name "*${PACKAGE_NAME}*.ipk" -type f | head -1)
+        
         if [ -n "$IPK_PATH" ]; then
-          echo "找到IPK文件: $IPK_PATH"
+          echo "✅ 找到IPK文件: $IPK_PATH"
+          echo "文件大小: $(du -h $IPK_PATH | cut -f1)"
           echo "IPK_PATH=$IPK_PATH" >> $GITHUB_ENV
         else
-          echo "未找到IPK文件!"
-          # 列出bin目录内容帮助调试
-          find $SDK_DIR/bin -type f -name "*.ipk" | head -10
+          echo "❌ 未找到IPK文件!"
+          echo "搜索路径:"
+          find $SDK_DIR -name "*.ipk" -type f | head -10
           exit 1
         fi
 
-    - name: 上传IPK文件
+    - name: Upload IPK artifact
       uses: actions/upload-artifact@v4
       with:
         name: ${{ env.PACKAGE_NAME }}-${{ inputs.openwrt_version }}-${{ inputs.architecture }}
         path: ${{ env.IPK_PATH }}
         retention-days: 30
 
-    - name: 显示构建信息
+    - name: Build summary
       if: always()
       run: |
-        echo "=== 构建完成 ==="
+        echo "=== 构建摘要 ==="
         echo "包名称: $PACKAGE_NAME"
-        echo "版本: ${{ inputs.openwrt_version }}"
-        echo "架构: ${{ inputs.architecture }}"
-        echo "状态: ${{ job.status }}"
+        echo "OpenWrt版本: ${{ inputs.openwrt_version }}"
+        echo "目标架构: ${{ inputs.architecture }}"
+        echo "构建状态: ${{ job.status }}"
+        
         if [ "${{ job.status }}" = "success" ]; then
-          echo "IPK文件已上传到Artifacts"
-          echo "文件: $IPK_PATH"
+          echo "✅ 构建成功!"
+          echo "📦 IPK文件: $IPK_PATH"
+        else
+          echo "❌ 构建失败!"
         fi
